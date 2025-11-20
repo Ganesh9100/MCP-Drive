@@ -1,4 +1,3 @@
-
 import streamlit as st
 import asyncio
 import json
@@ -22,7 +21,9 @@ from dotenv import load_dotenv, find_dotenv
 # --- PyVegas Standard Initialization ---
 try:
     os.environ["ENVIRONMENT"] = os.getenv("ENVIRONMENT", "dev")
-    os.environ["VEGAS_API_KEY"] = os.getenv("VEGAS_API_KEY", "")
+    # os.environ["VEGAS_API_KEY"] = os.getenv("VEGAS_API_KEY", "")
+    
+    os.environ["VEGAS_API_KEY"] = ""
     
     settings = get_settings()
     logger = get_logger(__name__)
@@ -99,7 +100,7 @@ def check_server_status():
         try:
             # First, try a simple HTTP GET to see if the server responds
             base_url = url.replace('/mcp', '')
-            response = requests.get(base_url, timeout=20)
+            response = requests.get(base_url, timeout=2)
             if response.status_code in [200, 404, 405]:  # Server is responding
                 # Now try a proper MCP tools/list request
                 mcp_response = requests.post(
@@ -110,8 +111,8 @@ def check_server_status():
                         "method": "tools/list",
                         "params": {}
                     },
-                    headers={"Content-Type": "application/json"},
-                    timeout=3
+                    headers={"Content-Type": "application/json","Accept":"text/event-stream"},stream=True,
+                    timeout=30
                 )
                 
                 # Check if we get a valid JSON-RPC response
@@ -148,8 +149,8 @@ def initialize_agent(tools):
         
         # Exact same LLM initialization as CLI version
         llm = VegasChatVertexAI(
-            usecase_name="ganeshtest",
-            context_name="ganeshtestprompt",
+            usecase_name="omnivoice_mdc",
+            context_name="order_status",
         ).bind_tools(tools=tools)
         
         print("LLM created and tools bound successfully")
