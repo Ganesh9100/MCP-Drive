@@ -1,50 +1,35 @@
+
 import streamlit as st
 import asyncio
 import json
 from pathlib import Path
 import os
 from datetime import datetime
+import pandas as pd
 import requests
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-# PyVegas imports (Assuming these are correctly installed and configured)
-try:
-    from pyvegas.core import get_settings, get_logger
-    from pyvegas.langx.llm import VegasChatVertexAI
-    PYVEGAS_AVAILABLE = True
-except ImportError:
-    PYVEGAS_AVAILABLE = False
-    class MockLLM:
-        def bind_tools(self, tools): return self
-        def __init__(self, *args, **kwargs): pass
-        async def ainvoke(self, messages): return {"content": "Mock LLM response: Please install PyVegas and set up your environment to enable the real agent."}
-    VegasChatVertexAI = MockLLM
+# PyVegas imports
+from pyvegas.core import get_settings, get_logger
+from pyvegas.langx.llm import VegasChatVertexAI
 
 # MCP and LangChain imports
-try:
-    from langchain_mcp_adapters.client import MultiServerMCPClient
-    from langchain.agents import create_agent
-    LANGCHAIN_MCP_AVAILABLE = True
-except ImportError:
-    LANGCHAIN_MCP_AVAILABLE = False
-
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain.agents import create_agent
 from dotenv import load_dotenv, find_dotenv
 
-# --- PyVegas Standard Initialization (Only if available) ---
-if PYVEGAS_AVAILABLE:
-    try:
-        os.environ["ENVIRONMENT"] = os.getenv("ENVIRONMENT", "dev")
-        os.environ["VEGAS_API_KEY"] = os.getenv("VEGAS_API_KEY", "")
-        
-        settings = get_settings()
-        logger = get_logger(__name__)
-        logger.info(f"Settings loaded successfully for environment: {settings.ENVIRONMENT}")
-    except Exception as e:
-        st.error(f"Failed to initialize PyVegas settings: {e}")
-        st.stop()
-else:
-    st.warning("PyVegas library not found. Using a mock LLM. Agent functionality will be limited.")
+# --- PyVegas Standard Initialization ---
+try:
+    os.environ["ENVIRONMENT"] = os.getenv("ENVIRONMENT", "dev")
+    os.environ["VEGAS_API_KEY"] = os.getenv("VEGAS_API_KEY", "")
+    
+    settings = get_settings()
+    logger = get_logger(__name__)
+    logger.info(f"Settings loaded successfully for environment: {settings.ENVIRONMENT}")
+except Exception as e:
+    st.error(f"Failed to initialize PyVegas settings: {e}")
+    st.stop()
 
 # Load environment variables
 env_path = find_dotenv()
@@ -64,7 +49,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Session State Initialization ---
+# Initialize session state
 if "conversation_history" not in st.session_state:
     st.session_state.conversation_history = []
 if "mcp_client" not in st.session_state:
@@ -73,9 +58,10 @@ if "tools" not in st.session_state:
     st.session_state.tools = []
 if "agent" not in st.session_state:
     st.session_state.agent = None
+if "server_status" not in st.session_state:
+    st.session_state.server_status = "Unknown"
 if "system_prompt" not in st.session_state:
     st.session_state.system_prompt = None
-
 # Persistent asyncio loop (one per Streamlit session)
 if "async_loop" not in st.session_state:
     st.session_state.async_loop = asyncio.new_event_loop()
@@ -88,85 +74,79 @@ if "async_loop" not in st.session_state:
 
 # Unified async runner using the persistent loop
 def run_async(coro, timeout: int = 120):
-    """Runs an async coroutine on the dedicated thread pool."""
     loop = st.session_state.async_loop
     future = asyncio.run_coroutine_threadsafe(coro, loop)
-    # The result() call is what blocks the Streamlit thread until the async task is done
     return future.result(timeout=timeout)
 
-# --- MCP Configuration (CRITICAL CHANGE) ---
-# Changed 'transport' from 'streamable_http' to 'http' to resolve the 'Not Acceptable: Client must accept text/event-stream' error.
+# MCP Configuration - try localhost first, fallback to 127.0.0.1
 MCP_CONFIG = {
     "orders": {
         "url": "http://127.0.0.1:8000/mcp",  # Match the exact server URL
-        "transport": "http", # <-- FIX: Use standard http
+        "transport": "streamable_http",
     }
 }
 
-# --- Initialization Functions ---
-
+@st.cache_data(ttl=30)
 def check_server_status():
-    """Check if the MCP server is running by attempting an MCP tools/list request."""
-    url = MCP_CONFIG["orders"]["url"]
+    """Check if the MCP server is running using proper MCP protocol"""
+    # Try both localhost and 127.0.0.1 to be safe
+    urls_to_try = [
+        "http://127.0.0.1:8000/mcp",
+        "http://localhost:8000/mcp"
+    ]
     
-    try:
-        mcp_response = requests.post(
-            url,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/list",
-                "params": {}
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=3
-        )
-        
-        if mcp_response.status_code == 200:
-            json_response = mcp_response.json()
-            if "jsonrpc" in json_response and ("result" in json_response or "error" in json_response):
-                return "Running"
-        
-    except requests.exceptions.ConnectionError:
-        return "Offline (Connection Refused)"
-    except requests.exceptions.Timeout:
-        return "Offline (Timeout)"
-    except Exception:
-        return "Offline (Error)"
+    for url in urls_to_try:
+        try:
+            # First, try a simple HTTP GET to see if the server responds
+            base_url = url.replace('/mcp', '')
+            response = requests.get(base_url, timeout=20)
+            if response.status_code in [200, 404, 405]:  # Server is responding
+                # Now try a proper MCP tools/list request
+                mcp_response = requests.post(
+                    url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                        "params": {}
+                    },
+                    headers={"Content-Type": "application/json"},
+                    timeout=3
+                )
+                
+                # Check if we get a valid JSON-RPC response
+                if mcp_response.status_code == 200:
+                    try:
+                        json_response = mcp_response.json()
+                        # Valid MCP response should have jsonrpc and either result or error
+                        if "jsonrpc" in json_response and ("result" in json_response or "error" in json_response):
+                            return "Running"
+                    except json.JSONDecodeError:
+                        continue
+                        
+        except Exception:
+            continue
     
-    return "Offline (Invalid Response)"
-
-
-async def _get_mcp_client_tools(mcp_config: dict):
-    """Async core function to fetch tools."""
-    if not LANGCHAIN_MCP_AVAILABLE:
-        raise ImportError("LangChain MCP adapter not available.")
-    client = MultiServerMCPClient(mcp_config)
-    # This is the line that makes an async network call to the server
-    tools = await client.get_tools()
-    return client, tools
-
+    return "Offline"
 
 def initialize_mcp_client():
     """Initialize MCP client and tools using persistent event loop."""
     try:
-        # Use run_async to execute the async part on the background loop
-        return run_async(_get_mcp_client_tools(MCP_CONFIG))
+        async def get_mcp_client_tools(mcp_config: dict):
+            client = MultiServerMCPClient(mcp_config)
+            tools = await client.get_tools()
+            return client, tools
+        return run_async(get_mcp_client_tools(MCP_CONFIG))
     except Exception as e:
         print(f"Error in initialize_mcp_client: {e}")
         return None, []
 
-
 def initialize_agent(tools):
-    """Initialize the LangChain agent with PyVegas LLM."""
-    if not LANGCHAIN_MCP_AVAILABLE:
-        st.error("LangChain MCP adapter not available. Cannot initialize agent.")
-        return None
-    
+    """Initialize the LangChain agent with PyVegas LLM - exact same pattern as CLI version"""
     try:
         print(f"Initializing agent with {len(tools)} tools")
         
-        # LLM initialization
+        # Exact same LLM initialization as CLI version
         llm = VegasChatVertexAI(
             usecase_name="ganeshtest",
             context_name="ganeshtestprompt",
@@ -174,7 +154,7 @@ def initialize_agent(tools):
         
         print("LLM created and tools bound successfully")
         
-        # System prompt
+        # Exact same system prompt as CLI version
         system_prompt = (
             "You are an orders management customer support agent. "
             "Give detailed responses — include all the details you have about the customer's order(s). "
@@ -184,7 +164,7 @@ def initialize_agent(tools):
         
         print("System prompt prepared")
         
-        # Agent creation
+        # Exact same agent creation as CLI version
         agent = create_agent(
             model=llm,
             tools=tools,
@@ -193,6 +173,7 @@ def initialize_agent(tools):
         
         print("Agent created successfully")
         
+        # Store system prompt for conversation history management
         st.session_state.system_prompt = system_prompt
         
         return agent
@@ -200,15 +181,14 @@ def initialize_agent(tools):
         error_msg = f"Failed to initialize agent: {e}"
         print(error_msg)
         st.error(error_msg)
+        # Show more details for debugging
         import traceback
         st.code(traceback.format_exc())
         return None
 
-# --- Chat & History Management ---
-
 def display_chat_history():
     """Display the conversation history"""
-    for message in st.session_state.conversation_history:
+    for i, message in enumerate(st.session_state.conversation_history):
         if message["role"] == "user":
             with st.chat_message("user"):
                 st.write(message["content"])
@@ -216,51 +196,41 @@ def display_chat_history():
             with st.chat_message("assistant"):
                 st.write(message["content"])
 
-async def _invoke_agent(agent, history):
-    """The actual async agent invocation."""
-    resp = await agent.ainvoke({"messages": history})
-    
-    assistant_text = None
-    if isinstance(resp, dict):
-        msgs = resp.get("messages")
-        if isinstance(msgs, list) and msgs:
-            last = msgs[-1]
-            assistant_text = (
-                (last.get("content") if isinstance(last, dict) else None)
-                or getattr(last, "content", None)
-                or resp.get("content")
-                or resp.get("text")
-            )
-    elif isinstance(resp, str):
-        assistant_text = resp
-        
-    if not assistant_text:
-        assistant_text = "<No content returned by agent. Check agent logs for errors.>"
-        
-    return assistant_text
-
 def process_user_message(user_input: str):
-    """Prepares history and runs the async agent invocation."""
+    """Process user message using background loop; avoid accessing st.session_state inside coroutine."""
+    ensure_session_state()
     if not st.session_state.agent:
-        return "Agent not initialized. Please check server connection in the sidebar."
-    
+        return "Agent not initialized. Please check server connection."
     agent = st.session_state.agent
     system_prompt = st.session_state.system_prompt
-    
-    # Build history for invocation (including system prompt for the agent's context)
+    # Build history for invocation
     history = list(st.session_state.conversation_history)
     if system_prompt and (not history or history[0].get("role") != "system"):
         history.insert(0, {"role": "system", "content": system_prompt})
     history.append({"role": "user", "content": user_input})
 
+    async def _invoke(a, h):
+        resp = await a.ainvoke({"messages": h})
+        assistant_text = None
+        if isinstance(resp, dict):
+            msgs = resp.get("messages")
+            if isinstance(msgs, list) and msgs:
+                last = msgs[-1]
+                assistant_text = (
+                    (last.get("content") if isinstance(last, dict) else None)
+                    or getattr(last, "content", None)
+                    or resp.get("content")
+                    or resp.get("text")
+                )
+        elif isinstance(resp, str):
+            assistant_text = resp
+        if not assistant_text:
+            assistant_text = "<no content returned by agent>"
+        return assistant_text
+
     try:
-        # Run the async invocation on the dedicated loop
-        assistant_text = run_async(_invoke_agent(agent, history))
+        assistant_text = run_async(_invoke(agent, history))
     except Exception as e:
-        # Log error details
-        import traceback
-        st.error(f"Error during agent invocation: {e}")
-        st.code(traceback.format_exc())
         return f"Error processing message: {e}"
 
     # Commit turns after successful response
@@ -288,34 +258,36 @@ def load_conversation_history():
             st.success("Conversation history loaded!")
         except Exception as e:
             st.error(f"Failed to load conversation: {e}")
-    else:
-        st.warning("No saved history file found.")
 
-# --- Main Application ---
+# Helper to ensure required session keys exist (robust against reruns)
+def ensure_session_state():
+    defaults = {
+        "conversation_history": [],
+        "mcp_client": None,
+        "tools": [],
+        "agent": None,
+        "server_status": "Unknown",
+        "system_prompt": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 def main():
     """Main Streamlit application"""
+    # Ensure session state is properly initialized
+    ensure_session_state()
     
     st.title("🛒 Order Management Chatbot")
     st.markdown("---")
     
     # Sidebar for connection and conversation management
     with st.sidebar:
-        st.header("🌐 MCP Server Status")
-        current_status = check_server_status()
-        if current_status == "Running":
-            st.success(f"Status: **{current_status}** at {MCP_CONFIG['orders']['url']}")
-        else:
-            st.error(f"Status: **{current_status}**")
-            st.info("Ensure the server is running in a separate terminal: `python order_server.py`")
-
-        st.markdown("---")
-        
-        # Initialize/Refresh connection
+        # Initialize/Refresh connection - non-blocking
         if st.button("Initialize/Refresh Connection"):
-            with st.spinner("Initializing MCP connection and Agent..."):
+            with st.spinner("Initializing MCP connection..."):
                 try:
-                    # Clear cache on purpose before attempting connection
+                    # Clear cache first
                     st.cache_data.clear()
                     
                     st.info("Connecting to MCP server...")
@@ -332,19 +304,21 @@ def main():
                         if agent:
                             st.session_state.agent = agent
                             st.success("✅ Agent initialized successfully!")
-                            st.success("🎉 All systems ready! You can now chat.")
+                            st.success("🎉 All systems ready! You can now chat with the agent.")
                         else:
                             st.error("❌ Could not initialize agent")
                     else:
-                        st.error("❌ Could not connect to MCP server or retrieve tools.")
+                        st.error("❌ Could not connect to MCP server")
+                        st.error("Make sure the server is running: `python order_server.py`")
                         
                 except Exception as e:
-                    st.error(f"❌ Connection failed during initialization: {e}")
+                    st.error(f"❌ Connection failed: {e}")
+                    st.error("Check if MCP server is running and accessible")
         
         st.markdown("---")
         
         # Conversation management
-        st.header("💾 Conversation History")
+        st.header("💾 Conversation")
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Save Chat"):
@@ -360,11 +334,11 @@ def main():
     # Main chat interface
     st.header("💬 Chat with Order Support Agent")
     
-    # Display connection status
+    # Display connection status - but don't block conversation
     if not st.session_state.agent:
-        st.warning("⚠️ Agent is **not** ready. Initialize connection in the sidebar to enable order lookup/cancellation.")
+        st.info("ℹ️ To use MCP tools, please initialize connection in the sidebar. You can still chat without tools.")
     else:
-        st.info(f"✅ Agent ready with {len(st.session_state.tools)} MCP tools.")
+        st.success("✅ Agent ready with MCP tools")
     
     # Chat container
     chat_container = st.container()
@@ -373,16 +347,28 @@ def main():
     with chat_container:
         display_chat_history()
     
-    # Chat input
+    # Chat input - ALWAYS enabled for better UX
     if user_input := st.chat_input("Type your message here..."):
         with st.chat_message("user"):
             st.write(user_input)
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                response = process_user_message(user_input)
+                if st.session_state.agent:
+                    response = process_user_message(user_input)
+                else:
+                    response = (
+                        "I'm ready to help with your order management questions! "
+                        "However, I don't currently have access to the order database tools. "
+                        "Please initialize the connection in the sidebar to access order information. "
+                        "\n\nIn the meantime, I can help you understand:\n"
+                        "- How to check order status\n"
+                        "- Order cancellation policies\n"
+                        "- General order management questions\n"
+                        "\nWhat would you like to know about order management?"
+                    )
                 st.write(response)
 
-    # Sample questions - always visible
+    # Sample questions - some work without tools
     st.markdown("---")
     st.header("💡 Sample Questions")
     
@@ -395,17 +381,34 @@ def main():
     ]):
         with cols[i % 2]:
             if st.button(question, key=f"sample_{i}"):
-                # Process the sample question as if it was typed
                 with st.chat_message("user"):
                     st.write(question)
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
-                        response = process_user_message(question)
+                        if st.session_state.agent:
+                            response = process_user_message(question)
+                        else:
+                            # Provide helpful responses based on question type
+                            if "cancel" in question.lower():
+                                response = (
+                                    "Order cancellation is typically only allowed when an order is in 'ORDERED' status. "
+                                    "Orders that are DISPATCHED, IN_TRANSIT, DELIVERED, or already CANCELLED cannot be cancelled. "
+                                    "To cancel an order, I would need your customer ID and order ID, and access to the order database."
+                                )
+                            elif "status" in question.lower():
+                                response = (
+                                    "Order statuses typically include: ORDERED, DISPATCHED, IN_TRANSIT, DELIVERED, and CANCELLED. "
+                                    "To check specific order status, I would need access to the order database tools."
+                                )
+                            else:
+                                response = (
+                                    "I'd be happy to help with that! To access specific order information, "
+                                    "please initialize the MCP connection in the sidebar first."
+                                )
                         st.write(response)
-                # Rerun to update the history instantly
                 st.rerun()
 
-    # Available Tools section
+    # Available Tools section (bottom right)
     if st.session_state.tools:
         st.markdown("---")
         with st.expander("🛠️ Available MCP Tools"):
@@ -418,6 +421,7 @@ def main():
                 with st.expander(f"**{tool_name}**"):
                     st.write(tool_desc)
                     
+                    # Show tool parameters if available
                     if hasattr(tool, 'args_schema') and tool.args_schema:
                         st.write("**Parameters:**")
                         try:
@@ -429,7 +433,6 @@ def main():
                                 st.write(f"- `{param_name}` ({param_type}): {param_desc}")
                         except Exception:
                             st.write("Parameter details not available")
-
 
 if __name__ == "__main__":
     main()
