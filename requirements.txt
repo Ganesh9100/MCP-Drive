@@ -1,0 +1,14 @@
+langchain-openai
+langchain-mcp-adapters
+mcp
+langgraph
+python-dotenv
+fastapi
+sse-starlette
+uvicorn[standard]
+langchain
+aiohttp
+httpx
+streamlit
+pandas
+requests
